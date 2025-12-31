@@ -8,6 +8,14 @@
 -define(API_PREFIX,get_env(api_prefix, "https://api.sparkpost.com/api/v1/")).
 -define(HTTP_OPTIONS, []).
 -define(OPTIONS, [{full_result,false}]).
+-define(SSL_OPTIONS, [
+    {verify, verify_peer},
+    {cacerts, public_key:cacerts_get()},
+    {server_name_indication, "api.sparkpost.com"},
+    {customize_hostname_check, [
+        {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
+    ]}
+]).
 
 -export([start_link/0,
 		 init/1,
@@ -98,8 +106,8 @@ handle_info(timeout,#data{queue=Queue} = Data) ->
 			spawn(fun() ->
 				try
 					int_send(?API_KEY,?API_PREFIX,From,To,Subject,Text,Html,Headers)
-				catch E:T ->
-					error_logger:error_msg("~p:~p~n~p~n",[E,T,erlang:get_stacktrace()])
+				catch E:T:S ->
+					error_logger:error_msg("~p:~p~n~p~n",[E,T,S])
 				end
 			end),
 			NQ;
@@ -129,12 +137,53 @@ int_send(TryNum,_APIKey,Prefix,From,To,Subject,Text,Html,Headers) when TryNum > 
 	EncodedJson = make_json(From, To, Subject, Text, Html, Headers),
 	Body = iolist_to_binary(EncodedJson),
     error_logger:info_msg("Sending: ~nAPI KEY: ~s~nURL: ~s~nMessage: ~s~n",[?API_KEY, URL, Body]),
-	case ibrowse:send_req(URL,[{authorization, ?API_KEY}],post,Body,[{content_type,"application/json"}]) of
-		{ok, _, _, Result} ->
-            error_logger:info_msg("Sent: ~p~n",[Result]),
+
+	%% Parse the URL to extract host and path
+	#{host := Host, path := Path} = uri_string:parse(URL),
+
+	%% Default HTTPS port
+	Port = 443,
+
+	%% Set up gun connection options with SSL
+	Opts = #{
+		protocols => [http],
+		transport => tls,
+		tls_opts => ?SSL_OPTIONS
+	},
+
+	%% Open connection to SparkPost API (with 10 second timeout)
+	{ok, ConnPid} = gun:open(Host, Port, Opts),
+	case gun:await_up(ConnPid, 10000) of
+		{ok, _Protocol} -> ok;
+		{error, UpError} ->
+			gun:close(ConnPid),
+			error_logger:info_msg("Error connecting: ~p~n", [UpError]),
+			throw({connection_failed, UpError})
+	end,
+
+	%% Prepare headers - gun expects a list of tuples
+	Headers2 = [
+		{<<"authorization">>, list_to_binary(?API_KEY)},
+		{<<"content-type">>, <<"application/json">>}
+	],
+
+	%% Send POST request
+	StreamRef = gun:post(ConnPid, Path, Headers2, Body),
+
+	%% Wait for response
+	case gun:await(ConnPid, StreamRef) of
+		{response, fin, _Status, _RespHeaders} ->
+			error_logger:info_msg("Sent successfully (no body)~n"),
+			gun:close(ConnPid),
+			do_nothing;
+		{response, nofin, _Status, _RespHeaders} ->
+			{ok, RespBody} = gun:await_body(ConnPid, StreamRef),
+			error_logger:info_msg("Sent: ~p~n",[RespBody]),
+			gun:close(ConnPid),
 			do_nothing;
 		{error, Reason} ->
-			error_logger:info_msg("Error In Send: ~p~n",[Reason])
+			error_logger:info_msg("Error In Send: ~p~n",[Reason]),
+			gun:close(ConnPid)
 	end.
 
 int_send(Server,Port,From,To,Subject,Text,Html,Headers) ->
