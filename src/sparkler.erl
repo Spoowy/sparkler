@@ -191,6 +191,13 @@ int_send(Server,Port,From,To,Subject,Text,Html,Headers) ->
 
 make_json(From, To, Subject, Text, Html, Headers) ->
     {_Headers2, ReplyTo} = extract_reply_to(Headers),
+    %% Attachments ride in Headers as {attachments, [{Name, MimeType, Binary}]}
+    %% so no record or arity changes are needed anywhere in the queue path.
+    AttachOption = case proplists:get_value(attachments, Headers, []) of
+        [] -> [];
+        As -> [{attachments, [[{name, i2b(N)}, {type, i2b(T)}, {data, base64:encode(D)}]
+                              || {N, T, D} <- As]}]
+    end,
     ReplyToOption = case ReplyTo of
         undefined -> [];
         _ -> [{reply_to, i2b(ReplyTo)}]
@@ -206,7 +213,7 @@ make_json(From, To, Subject, Text, Html, Headers) ->
 			{text, i2b(Text)},
 			{subject, i2b(Subject)},
             {from, [{email, i2b(FromEmail)}, {name, i2b(FromName)}]}
-        ] ++ ReplyToOption ++ HtmlOption},
+        ] ++ ReplyToOption ++ HtmlOption ++ AttachOption},
         {recipients,[
             [{address, [{email,i2b(ToEmail)},{name,i2b(ToName)}]}]
         ]},
